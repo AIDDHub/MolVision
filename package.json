@@ -1,0 +1,52 @@
+{
+  "name": "molvision",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop molecular structure viewer and figure exporter",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "dist": "electron-builder",
+    "test": "node --test tests/*.test.mjs",
+    "test:e2e": "node tests/e2e-smoke.mjs"
+  },
+  "devDependencies": {
+    "electron": "45.4.1",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "org.molvision.desktop",
+    "productName": "MolVision",
+    "asar": false,
+    "files": [
+      "electron/**/*",
+      "webapp/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "icon": "build/icon.png"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Science",
+      "icon": "build/icon.png"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.education",
+      "icon": "build/icon.png"
+    }
+  },
+  "author": "MolVision"
+}

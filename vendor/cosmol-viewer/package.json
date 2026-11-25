@@ -1,0 +1,32 @@
+{
+  "name": "@cosmol-studio/cosmol-viewer",
+  "type": "module",
+  "description": "Molecular visualization tools by rust",
+  "version": "0.6.2",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cosmol-studio/COSMol-viewer"
+  },
+  "files": [
+    "cosmol_viewer_wasm_bg.wasm",
+    "cosmol_viewer_wasm.js",
+    "cosmol_viewer_wasm.d.ts",
+    "index.js",
+    "index.d.ts"
+  ],
+  "main": "index.js",
+  "homepage": "https://github.com/cosmol-studio/COSMol-viewer",
+  "types": "index.d.ts",
+  "sideEffects": [
+    "./snippets/*",
+    "./index.js"
+  ],
+  "dependencies": {
+    "@cosmol-studio/cosmolkit": "0.6.2"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "latest"
+  }
+}

@@ -1,0 +1,663 @@
+/// Binding-owned source references follow the lifetime of scene content.
+/// Update this only after the corresponding scene operation succeeds.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct SourceReferences<T> {
+    named: std::collections::HashMap<String, T>,
+    unnamed: Vec<T>,
+}
+impl<T> Default for SourceReferences<T> {
+    fn default() -> Self {
+        Self {
+            named: Default::default(),
+            unnamed: Vec::new(),
+        }
+    }
+}
+impl<T> SourceReferences<T> {
+    pub fn add(&mut self, source: Option<T>) {
+        if let Some(source) = source {
+            self.unnamed.push(source);
+        }
+    }
+    pub fn set(&mut self, name: &str, source: Option<T>) {
+        if let Some(source) = source {
+            self.named.insert(name.to_owned(), source);
+        } else {
+            self.remove(name);
+        }
+    }
+    pub fn remove(&mut self, name: &str) {
+        self.named.remove(name);
+    }
+}
+impl<T: Clone> SourceReferences<T> {
+    pub fn merge(&mut self, other: &Self) {
+        // Core Scene::merge_shapes appends all incoming content as unnamed.
+        self.unnamed.extend(other.named.values().cloned());
+        self.unnamed.extend(other.unnamed.iter().cloned());
+    }
+}
+
+use crate::utils::Color;
+use crate::utils::InstanceGroups;
+use crate::utils::Logger;
+use glam::Mat3;
+use glam::Mat4;
+use rayon::prelude::*;
+use std::collections::HashMap;
+use thiserror::Error;
+
+use glam::Vec3;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    Shape,
+    shader::CameraState,
+    utils::{self, Interpolatable, IntoInstanceGroups, ToMesh},
+};
+
+// pub enum Instance {
+//     Sphere(SphereInstance),
+// }
+//
+
+#[repr(C)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Scene {
+    pub background_color: Vec3,
+    #[serde(default)]
+    pub transparent_background: bool,
+    #[serde(default)]
+    pub zoom_disabled: bool,
+    #[serde(default)]
+    pub outline_enabled: bool,
+    #[serde(default)]
+    pub ssao_enabled: bool,
+    #[serde(default = "default_outline_strength")]
+    pub outline_strength: f32,
+    #[serde(default = "default_ssao_strength")]
+    pub ssao_strength: f32,
+    #[serde(default)]
+    pub auto_rotate: AutoRotate,
+    #[serde(default)]
+    pub depth_cue: DepthCue,
+    pub camera_state: Option<CameraState>,
+    pub named_shapes: HashMap<String, Shape>,
+    pub unnamed_shapes: Vec<Shape>,
+    pub scale: f32,
+    pub viewport: Option<[usize; 2]>,
+    pub scene_center: [f32; 3],
+    pub camera_lights: Option<Lighting>,
+}
+
+#[derive(Error, Debug)]
+pub enum SceneError {
+    #[error("Shape with ID '{0}' not found")]
+    ShapeNotFound(String),
+    #[error("Failed to parse scene from JSON")]
+    ParseError(#[from] serde_json::Error),
+}
+
+impl Default for Scene {
+    fn default() -> Self {
+        Self {
+            background_color: Vec3::ONE,
+            transparent_background: false,
+            zoom_disabled: false,
+            outline_enabled: false,
+            ssao_enabled: false,
+            outline_strength: default_outline_strength(),
+            ssao_strength: default_ssao_strength(),
+            auto_rotate: AutoRotate::default(),
+            depth_cue: DepthCue::default(),
+            camera_state: None,
+            named_shapes: HashMap::new(),
+            unnamed_shapes: Vec::new(),
+            scale: 1.0,
+            viewport: None,
+            scene_center: [0.0, 0.0, 0.0],
+            camera_lights: None,
+        }
+    }
+}
+
+impl Scene {
+    pub fn _get_meshes(&self) -> Vec<utils::MeshData> {
+        let scale = self.scale;
+
+        let (mut a, mut b) = rayon::join(
+            || {
+                self.named_shapes
+                    .par_iter()
+                    .map(|(_, s)| s.to_mesh(scale))
+                    .collect::<Vec<_>>()
+            },
+            || {
+                self.unnamed_shapes
+                    .par_iter()
+                    .map(|s| s.to_mesh(scale))
+                    .collect::<Vec<_>>()
+            },
+        );
+
+        a.append(&mut b);
+        a
+    }
+
+    pub fn get_instances_grouped(&self) -> InstanceGroups {
+        let scale = self.scale;
+        let shape_count = self.named_shapes.len() + self.unnamed_shapes.len();
+
+        if shape_count <= 128 {
+            let mut groups = InstanceGroups::default();
+
+            for shape in self.named_shapes.values() {
+                groups.merge(shape.to_instance_group(scale));
+            }
+
+            for shape in &self.unnamed_shapes {
+                groups.merge(shape.to_instance_group(scale));
+            }
+
+            return groups;
+        }
+
+        // 分别处理两部分
+        let (named_groups, unnamed_groups) = rayon::join(
+            || {
+                self.named_shapes
+                    .par_iter()
+                    .map(|(_, s)| s.to_instance_group(scale))
+                    .reduce(
+                        || InstanceGroups::default(),
+                        |mut acc, g| {
+                            acc.merge(g);
+                            acc
+                        },
+                    )
+            },
+            || {
+                self.unnamed_shapes
+                    .par_iter()
+                    .map(|s| s.to_instance_group(scale))
+                    .reduce(
+                        || InstanceGroups::default(),
+                        |mut acc, g| {
+                            acc.merge(g);
+                            acc
+                        },
+                    )
+            },
+        );
+
+        let mut result = named_groups;
+        result.merge(unnamed_groups);
+        result
+    }
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add an entire scientific object or a source-bound selection.
+    /// Projection completes before the scene is changed.
+    pub fn add<T: crate::display::SceneItem>(
+        &mut self,
+        item: T,
+    ) -> Result<(), crate::display::DisplayError> {
+        let shape = item.to_shape(None)?;
+        self.unnamed_shapes.push(shape);
+        Ok(())
+    }
+
+    /// Create or replace named content. Failed projections preserve the old content.
+    pub fn set<T: crate::display::SceneItem>(
+        &mut self,
+        name: impl Into<String>,
+        item: T,
+    ) -> Result<(), crate::display::DisplayError> {
+        let shape = item.to_shape(None)?;
+        self.named_shapes.insert(name.into(), shape);
+        Ok(())
+    }
+
+    /// Frame a scientific object without translating its coordinates.
+    /// Works before or after `add`, independently of display IDs and styles.
+    /// Missing or ambiguous coordinates leave the current scene center unchanged.
+    pub fn recenter_on<S: crate::display::CenterSource + ?Sized>(
+        &mut self,
+        source: &S,
+    ) -> Result<(), crate::display::DisplayError> {
+        let center = source.center()?;
+        if !center.iter().all(|value| value.is_finite()) {
+            return Err(crate::display::DisplayError::InvalidCoordinates);
+        }
+        self.scene_center = center;
+        Ok(())
+    }
+
+    pub fn recenter(&mut self, center: [f32; 3]) {
+        self.scene_center = center;
+    }
+
+    pub fn set_scale(&mut self, scale: f32) {
+        self.scale = scale;
+    }
+
+    pub fn remove_shape(&mut self, id: &str) -> Result<(), SceneError> {
+        if self.named_shapes.remove(id).is_none() {
+            Err(SceneError::ShapeNotFound(id.to_string()))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn set_background_color<C: Into<Color>>(&mut self, background_color: C) {
+        self.background_color = background_color.into().into()
+    }
+
+    pub fn set_transparent_background(&mut self, enabled: bool) {
+        self.transparent_background = enabled;
+    }
+
+    pub fn set_outline_enabled(&mut self, enabled: bool) {
+        self.outline_enabled = enabled;
+    }
+
+    pub fn set_ssao_enabled(&mut self, enabled: bool) {
+        self.ssao_enabled = enabled;
+    }
+
+    pub fn set_outline_strength(&mut self, strength: f32) {
+        self.outline_strength = strength.clamp(0.0, 1.0);
+    }
+
+    pub fn set_ssao_strength(&mut self, strength: f32) {
+        self.ssao_strength = strength.clamp(0.0, 1.0);
+    }
+
+    pub fn set_zoom_disabled(&mut self, disabled: bool) {
+        self.zoom_disabled = disabled;
+    }
+
+    pub fn set_auto_rotate(&mut self, enabled: bool, speed: f32) {
+        self.auto_rotate = AutoRotate { enabled, speed };
+    }
+
+    /// Enable or disable depth cueing for the whole scene.
+    ///
+    /// Depth cueing follows the ChimeraX model: fragment color is linearly
+    /// mixed toward the cue color according to camera-space depth. By default,
+    /// depth cueing is disabled. When enabled, the default cue color follows the
+    /// scene background color, so distant geometry fades into the background. It
+    /// applies to all standard rendered geometry, including molecules, sticks,
+    /// spheres, ribbons, and protein surfaces.
+    pub fn set_depth_cue(&mut self, enabled: bool) {
+        self.depth_cue.enabled = enabled;
+    }
+
+    /// Set the fractional depth cue range.
+    ///
+    /// `start` and `end` are fractions of the current scene depth range. Dimming
+    /// begins at `start` and reaches the cue color at `end`. The default range is
+    /// `0.5..1.0`, matching ChimeraX defaults. The range is only used when depth
+    /// cueing is enabled with [`set_depth_cue`](Self::set_depth_cue).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `start` and `end` do not satisfy `0.0 <= start < end <= 1.0`.
+    pub fn set_depth_cue_range(&mut self, start: f32, end: f32) {
+        if !(0.0..=1.0).contains(&start) || !(0.0..=1.0).contains(&end) || start >= end {
+            panic!("depth cue range must satisfy 0.0 <= start < end <= 1.0");
+        }
+        self.depth_cue.start = start;
+        self.depth_cue.end = end;
+    }
+
+    /// Set an explicit depth cue color.
+    ///
+    /// If this is not called, depth cueing fades geometry toward the scene
+    /// background color. Use this method to override that behavior, for example
+    /// to fade toward black on a non-black background.
+    pub fn set_depth_cue_color<C: Into<Color>>(&mut self, color: C) {
+        self.depth_cue.color = Some(color.into().into());
+    }
+
+    pub fn use_black_background(&mut self) {
+        self.background_color = Vec3::ZERO;
+    }
+
+    pub fn set_camera_view(
+        &mut self,
+        azimuth: f32,
+        elevation: f32,
+        roll: f32,
+        distance: f32,
+        target: [f32; 3],
+        fov: f32,
+    ) {
+        self.camera_state = Some(CameraState::from_orbit_angles(
+            azimuth, elevation, roll, distance, target, fov,
+        ));
+    }
+
+    pub fn rotate_camera(&mut self, azimuth_delta: f32, elevation_delta: f32, roll_delta: f32) {
+        let mut camera_state = self.camera_state.unwrap_or_default();
+        camera_state.rotate_by_degrees(azimuth_delta, elevation_delta, roll_delta);
+        self.camera_state = Some(camera_state);
+    }
+
+    pub fn set_camera_distance(&mut self, distance: f32) {
+        let mut camera_state = self.camera_state.unwrap_or_default();
+        camera_state.distance = distance;
+        self.camera_state = Some(camera_state);
+    }
+
+    pub fn set_camera_target(&mut self, target: [f32; 3]) {
+        let mut camera_state = self.camera_state.unwrap_or_default();
+        camera_state.target = Vec3::from(target);
+        self.camera_state = Some(camera_state);
+    }
+
+    pub fn set_camera_fov(&mut self, fov: f32) {
+        let mut camera_state = self.camera_state.unwrap_or_default();
+        camera_state.fov = fov;
+        self.camera_state = Some(camera_state);
+    }
+
+    pub fn prepare_for_wasm(&mut self) {
+        // Scientific projections (including DSSP) are prepared by show().
+        // Renderer transport carries ready-to-draw geometry on every platform.
+    }
+
+    /// === u_model ===
+    pub fn model_matrix(&self) -> Mat4 {
+        Mat4::from_translation(-Vec3::from(self.scene_center) * self.scale)
+    }
+
+    /// === u_normal_matrix ===
+    pub fn normal_matrix(&self) -> Mat3 {
+        Mat3::from_mat4(self.model_matrix()).inverse().transpose()
+    }
+
+    pub fn merge_shapes(&mut self, other: &Self) {
+        self.unnamed_shapes
+            .extend(other.named_shapes.iter().map(|(_k, v)| v.clone()));
+        self.unnamed_shapes.extend(other.unnamed_shapes.clone());
+    }
+
+    pub fn add_camera_light(&mut self, light: Lighting) {
+        self.camera_lights = Some(light);
+    }
+
+    pub fn set_lighting(
+        &mut self,
+        ambient: f32,
+        diffuse: f32,
+        specular: f32,
+        intensity: f32,
+        color: Vec3,
+    ) {
+        self.camera_lights = Some(Lighting {
+            ambient: AmbientLight {
+                intensity: ambient,
+                color,
+            },
+            directionals: Some(DirectionalLight {
+                diffuse,
+                specular,
+                intensity,
+                color,
+                ..Lighting::default_directional()
+            }),
+            points: None,
+        });
+    }
+
+    pub fn set_light_intensity(&mut self, intensity: f32) {
+        let mut lighting = self.camera_lights.clone().unwrap_or_default();
+        if let Some(directional) = lighting.directionals.as_mut() {
+            directional.intensity = intensity;
+        }
+        self.camera_lights = Some(lighting);
+    }
+
+    pub fn set_ambient_light(&mut self, intensity: f32) {
+        let mut lighting = self.camera_lights.clone().unwrap_or_default();
+        lighting.ambient.intensity = intensity;
+        self.camera_lights = Some(lighting);
+    }
+
+    pub fn set_light_color<C: Into<Color>>(&mut self, color: C) {
+        let color = color.into().into();
+        let mut lighting = self.camera_lights.clone().unwrap_or_default();
+        lighting.ambient.color = color;
+        if let Some(directional) = lighting.directionals.as_mut() {
+            directional.color = color;
+        }
+        self.camera_lights = Some(lighting);
+    }
+
+    pub fn add_world_light(&mut self, light: Lighting) {
+        println!("{:?}", light);
+        unimplemented!()
+    }
+}
+
+impl Interpolatable for Scene {
+    fn interpolate(&self, other: &Self, t: f32, logger: impl Logger) -> Self {
+        let named_shapes = self
+            .named_shapes
+            .iter()
+            .filter_map(|(k, v)| {
+                other
+                    .named_shapes
+                    .get(k)
+                    .map(|ov| (k.clone(), v.interpolate(ov, t, logger)))
+            })
+            .collect();
+
+        let unnamed_shapes = self
+            .unnamed_shapes
+            .iter()
+            .zip(&other.unnamed_shapes)
+            .map(|(a, b)| a.interpolate(b, t, logger))
+            .collect();
+
+        let scene_center =
+            Vec3::from(self.scene_center) * (1.0 - t) + Vec3::from(other.scene_center) * t;
+
+        Self {
+            background_color: self.background_color,
+            transparent_background: self.transparent_background,
+            zoom_disabled: self.zoom_disabled,
+            outline_enabled: self.outline_enabled,
+            ssao_enabled: self.ssao_enabled,
+            outline_strength: self.outline_strength,
+            ssao_strength: self.ssao_strength,
+            auto_rotate: self.auto_rotate,
+            depth_cue: self.depth_cue,
+            camera_state: self.camera_state,
+            named_shapes,
+            unnamed_shapes,
+            scale: self.scale * (1.0 - t) + other.scale * t,
+            viewport: self.viewport,
+            scene_center: [scene_center.x, scene_center.y, scene_center.z],
+            camera_lights: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct AutoRotate {
+    pub enabled: bool,
+    pub speed: f32,
+}
+
+impl Default for AutoRotate {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            speed: 20.0,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct DepthCue {
+    pub enabled: bool,
+    pub start: f32,
+    pub end: f32,
+    #[serde(default)]
+    pub color: Option<Vec3>,
+}
+
+impl Default for DepthCue {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start: 0.5,
+            end: 1.0,
+            color: None,
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct Animation {
+    pub static_scene: Option<Scene>,
+    pub frames: Vec<Scene>,
+    pub interval: u64,
+    pub loops: i64, // -1 = infinite
+    pub interpolate: bool,
+}
+
+impl Animation {
+    pub fn new(interval: f32, loops: i64, interpolate: bool) -> Self {
+        Self {
+            static_scene: None,
+            frames: Vec::new(),
+            interval: (interval * 1000.0) as u64,
+            loops,
+            interpolate,
+        }
+    }
+
+    /// Set the time between animation frames in seconds.
+    pub fn set_interval(&mut self, interval: f32) {
+        self.interval = (interval * 1000.0) as u64;
+    }
+
+    /// Set the number of animation loops. Use -1 for infinite looping.
+    pub fn set_loops(&mut self, loops: i64) {
+        self.loops = loops;
+    }
+
+    /// Enable or disable interpolation between animation frames.
+    pub fn set_interpolate(&mut self, interpolate: bool) {
+        self.interpolate = interpolate;
+    }
+
+    pub fn add_frame(&mut self, frame: Scene) {
+        self.frames.push(frame);
+    }
+
+    pub fn set_static_scene(&mut self, scene: Scene) {
+        self.static_scene = Some(scene);
+    }
+}
+
+#[cfg(test)]
+mod animation_tests {
+    use super::Animation;
+
+    #[test]
+    fn set_playback_options_updates_animation_state() {
+        let mut animation = Animation::new(0.05, -1, false);
+        animation.set_interval(0.02);
+        animation.set_loops(3);
+        animation.set_interpolate(true);
+        assert_eq!(animation.interval, 20);
+        assert_eq!(animation.loops, 3);
+        assert!(animation.interpolate);
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AmbientLight {
+    pub intensity: f32,
+    pub color: Vec3,
+}
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DirectionalLight {
+    pub direction: Vec3,
+    pub intensity: f32,
+    #[serde(default = "default_diffuse_light")]
+    pub diffuse: f32,
+    #[serde(default = "default_specular_light")]
+    pub specular: f32,
+    pub color: Vec3,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PointLight {
+    position: Vec3,
+    intensity: f32,
+    color: Vec3,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Lighting {
+    pub ambient: AmbientLight,
+    pub directionals: Option<DirectionalLight>,
+    pub points: Option<PointLight>,
+}
+
+impl Default for Lighting {
+    fn default() -> Self {
+        Self {
+            ambient: AmbientLight {
+                intensity: default_ambient_light(),
+                color: default_light_color(),
+            },
+            directionals: Some(Self::default_directional()),
+            points: None,
+        }
+    }
+}
+
+impl Lighting {
+    pub fn default_directional() -> DirectionalLight {
+        DirectionalLight {
+            direction: Vec3::new(-1.0, 1.0, 5.0) * 1000.0,
+            color: default_light_color(),
+            intensity: default_light_intensity(),
+            diffuse: default_diffuse_light(),
+            specular: default_specular_light(),
+        }
+    }
+}
+
+pub fn default_light_color() -> Vec3 {
+    Vec3::new(1.0, 0.97, 0.97)
+}
+
+fn default_light_intensity() -> f32 {
+    1.0
+}
+
+fn default_ambient_light() -> f32 {
+    0.55
+}
+
+fn default_diffuse_light() -> f32 {
+    0.65
+}
+
+fn default_specular_light() -> f32 {
+    1.0
+}
+
+fn default_outline_strength() -> f32 { 0.2 }
+fn default_ssao_strength() -> f32 { 0.1 }

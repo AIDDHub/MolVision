@@ -1,0 +1,352 @@
+--- a/crates/core/src/scene.rs
++++ b/crates/core/src/scene.rs
+@@ -71,6 +71,14 @@
+     #[serde(default)]
+     pub zoom_disabled: bool,
+     #[serde(default)]
++    pub outline_enabled: bool,
++    #[serde(default)]
++    pub ssao_enabled: bool,
++    #[serde(default = "default_outline_strength")]
++    pub outline_strength: f32,
++    #[serde(default = "default_ssao_strength")]
++    pub ssao_strength: f32,
++    #[serde(default)]
+     pub auto_rotate: AutoRotate,
+     #[serde(default)]
+     pub depth_cue: DepthCue,
+@@ -97,6 +105,10 @@
+             background_color: Vec3::ONE,
+             transparent_background: false,
+             zoom_disabled: false,
++            outline_enabled: false,
++            ssao_enabled: false,
++            outline_strength: default_outline_strength(),
++            ssao_strength: default_ssao_strength(),
+             auto_rotate: AutoRotate::default(),
+             depth_cue: DepthCue::default(),
+             camera_state: None,
+@@ -249,6 +261,22 @@
+         self.transparent_background = enabled;
+     }
+ 
++    pub fn set_outline_enabled(&mut self, enabled: bool) {
++        self.outline_enabled = enabled;
++    }
++
++    pub fn set_ssao_enabled(&mut self, enabled: bool) {
++        self.ssao_enabled = enabled;
++    }
++
++    pub fn set_outline_strength(&mut self, strength: f32) {
++        self.outline_strength = strength.clamp(0.0, 1.0);
++    }
++
++    pub fn set_ssao_strength(&mut self, strength: f32) {
++        self.ssao_strength = strength.clamp(0.0, 1.0);
++    }
++
+     pub fn set_zoom_disabled(&mut self, disabled: bool) {
+         self.zoom_disabled = disabled;
+     }
+@@ -444,6 +472,10 @@
+             background_color: self.background_color,
+             transparent_background: self.transparent_background,
+             zoom_disabled: self.zoom_disabled,
++            outline_enabled: self.outline_enabled,
++            ssao_enabled: self.ssao_enabled,
++            outline_strength: self.outline_strength,
++            ssao_strength: self.ssao_strength,
+             auto_rotate: self.auto_rotate,
+             depth_cue: self.depth_cue,
+             camera_state: self.camera_state,
+@@ -626,3 +658,6 @@
+ fn default_specular_light() -> f32 {
+     1.0
+ }
++
++fn default_outline_strength() -> f32 { 0.2 }
++fn default_ssao_strength() -> f32 { 0.1 }
+--- a/crates/core/src/shapes/mesh.rs
++++ b/crates/core/src/shapes/mesh.rs
+@@ -0,0 +1,21 @@
++use crate::utils::MeshData;
++
++/// Arbitrary triangle mesh supplied by a host language (ribbons, planes, ...).
++#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
++pub struct Mesh {
++    pub data: MeshData,
++}
++
++impl Mesh {
++    pub fn new(data: MeshData) -> Self {
++        Self { data }
++    }
++
++    pub fn scaled(&self, scale: f32) -> MeshData {
++        let mut mesh = self.data.clone();
++        for vertex in &mut mesh.vertices {
++            *vertex *= scale;
++        }
++        mesh
++    }
++}
+--- a/crates/core/src/shapes/mod.rs
++++ b/crates/core/src/shapes/mod.rs
+@@ -1,6 +1,8 @@
+ mod sphere;
+ pub use sphere::Sphere;
+ pub use sphere::SphereInstance;
++mod mesh;
++pub use mesh::Mesh;
+ mod stick;
+ pub use stick::Stick;
+ pub use stick::StickInstance;
+--- a/crates/core/src/utils.rs
++++ b/crates/core/src/utils.rs
+@@ -1,4 +1,5 @@
+ use glam::{Mat4, Vec3, Vec4};
++pub use glam::{Vec3 as Vec3Pub, Vec4 as Vec4Pub};
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::display::Display;
+@@ -66,6 +67,7 @@
+ pub enum Shape {
+     Sphere(Sphere),
+     Stick(Stick),
++    Mesh(crate::shapes::Mesh),
+     Display(Display),
+     Qudrate, // Custom(CustomShape),
+              // ...
+@@ -89,6 +91,7 @@
+         match (self, other) {
+             (Shape::Sphere(a), Shape::Sphere(b)) => Shape::Sphere(a.interpolate(b, t, logger)),
+             (Shape::Stick(a), Shape::Stick(b)) => Shape::Stick(a.interpolate(b, t, logger)),
++            (Shape::Mesh(a), Shape::Mesh(b)) => Shape::Mesh(if t < 0.5 { a.clone() } else { b.clone() }),
+             (Shape::Display(a), Shape::Display(b)) => Shape::Display(a.interpolate(b, t, logger)),
+             _ => self.clone(), // 如果类型不匹配，可以选择不插值或做默认处理
+         }
+@@ -165,6 +168,7 @@
+         match self {
+             Shape::Sphere(s) => s.to_mesh(scale),
+             Shape::Stick(s) => s.to_mesh(scale),
++            Shape::Mesh(mesh) => mesh.scaled(scale),
+             Shape::Display(display) => display.mesh(scale),
+             Shape::Qudrate => todo!(),
+         }
+@@ -180,6 +184,8 @@
+     pub material_params: Option<Vec<[f32; 2]>>,
+     pub transform: Option<Mat4>, // 可选位移旋转缩放
+     pub is_wireframe: bool,
++    #[serde(default)]
++    pub double_sided: bool,
+ }
+ 
+ impl MeshData {
+@@ -210,6 +216,7 @@
+             self.material_params = Some(other_params.clone());
+         }
+ 
++        self.double_sided |= other.double_sided;
+         // append indices with offset
+         self.indices.extend(other.indices.iter().map(|i| i + base));
+     }
+--- a/crates/core/src/display/mod.rs
++++ b/crates/core/src/display/mod.rs
+@@ -193,6 +193,17 @@
+                 validate_geometry(&s.start, s.thickness_radius)?;
+                 validate_geometry(&s.end, s.thickness_radius)?;
+             }
++            Self::Mesh(mesh) => {
++                if mesh.data.vertices.iter().any(|v| !v.is_finite()) {
++                    return Err(DisplayError::InvalidCoordinates);
++                }
++                if mesh.data.indices.iter().any(|i| *i as usize >= mesh.data.vertices.len()) {
++                    return Err(DisplayError::InvalidCoordinates);
++                }
++                if !mesh.data.normals.is_empty() && mesh.data.normals.len() != mesh.data.vertices.len() {
++                    return Err(DisplayError::InvalidCoordinates);
++                }
++            }
+             _ => {}
+         }
+         Ok(self.clone())
+@@ -217,6 +228,11 @@
+         crate::utils::Shape::Stick(*self).to_shape(style)
+     }
+ }
++impl SceneItem for crate::shapes::Mesh {
++    fn to_shape(&self, style: Option<Representation>) -> Result<crate::utils::Shape, DisplayError> {
++        crate::utils::Shape::Mesh(self.clone()).to_shape(style)
++    }
++}
+ 
+ /// A scientific object that supplies a geometric center for scene framing.
+ /// Callers of `Scene::recenter_on` do not need to import this trait.
+--- a/crates/core/src/shapes/stick.rs
++++ b/crates/core/src/shapes/stick.rs
+@@ -216,6 +216,7 @@
+             material_params: Some(material_params),
+             transform: None,
+             is_wireframe: self.style.wireframe,
++            double_sided: false,
+         }
+     }
+ 
+--- a/wasm/src/scene.rs
++++ b/wasm/src/scene.rs
+@@ -46,6 +46,18 @@
+     pub fn new() -> Self {
+         CoreScene::new().into()
+     }
++    pub fn set_outline_enabled(&self, enabled: bool) {
++        self.state.lock().unwrap().set_outline_enabled(enabled);
++    }
++    pub fn set_ssao_enabled(&self, enabled: bool) {
++        self.state.lock().unwrap().set_ssao_enabled(enabled);
++    }
++    pub fn set_outline_strength(&self, strength: f32) {
++        self.state.lock().unwrap().set_outline_strength(strength);
++    }
++    pub fn set_ssao_strength(&self, strength: f32) {
++        self.state.lock().unwrap().set_ssao_strength(strength);
++    }
+     /// Explicitly copy scene display state into an independent scene.
+     pub fn clone_scene(&self) -> Self {
+         let copy: Self = self.snapshot().into();
+--- a/wasm/src/shapes.rs
++++ b/wasm/src/shapes.rs
+@@ -1,7 +1,8 @@
+ //! Positioned shapes retain their own material; Scene snapshots them on insertion.
+ use cosmol_viewer_core::{
+     display::SceneItem,
+-    shapes::{Sphere as CoreSphere, Stick as CoreStick},
++    shapes::{Mesh as CoreMesh, Sphere as CoreSphere, Stick as CoreStick},
++    utils::{MeshData, Vec3Pub as Vec3, Vec4Pub as Vec4},
+ };
+ use wasm_bindgen::prelude::*;
+ #[derive(Clone)]
+@@ -16,6 +17,12 @@
+ }
+ impl crate::input::NativeOutput for Sphere {}
+ impl crate::input::NativeOutput for Stick {}
++#[derive(Clone)]
++#[wasm_bindgen]
++pub struct Mesh {
++    pub(crate) inner: CoreMesh,
++}
++impl crate::input::NativeOutput for Mesh {}
+ #[cosmol_viewer_derive::checked_wasm]
+ impl Sphere {
+     pub fn new(center: Vec<f32>, radius: f32) -> Result<Self, String> {
+@@ -68,3 +75,63 @@
+         })
+     }
+ }
++
++#[cosmol_viewer_derive::checked_wasm]
++impl Mesh {
++    pub fn new(
++        vertices: Vec<f32>,
++        indices: Vec<u32>,
++        normals: Vec<f32>,
++        colors: Vec<u8>,
++    ) -> Result<Self, String> {
++        if vertices.len() % 3 != 0 {
++            return Err("Vertices must be a flat xyz array".into());
++        }
++        if !normals.is_empty() && normals.len() != vertices.len() {
++            return Err("Normals must match vertices".into());
++        }
++        let positions: Vec<Vec3> = vertices
++            .chunks_exact(3)
++            .map(|v| Vec3::new(v[0], v[1], v[2]))
++            .collect();
++        if positions.iter().any(|v| !v.is_finite()) {
++            return Err("Vertices must be finite".into());
++        }
++        let normals: Vec<Vec3> = normals
++            .chunks_exact(3)
++            .map(|v| Vec3::new(v[0], v[1], v[2]))
++            .collect();
++        let colors = if colors.is_empty() {
++            None
++        } else {
++            if colors.len() != positions.len() * 4 {
++                return Err("Colors must be RGBA per vertex".into());
++            }
++            Some(
++                colors
++                    .chunks_exact(4)
++                    .map(|c| Vec4::new(c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, c[3] as f32 / 255.0))
++                    .collect(),
++            )
++        };
++        if indices.iter().any(|index| *index as usize >= positions.len()) {
++            return Err("Index out of range".into());
++        }
++        let inner = CoreMesh::new(MeshData {
++            vertices: positions,
++            normals,
++            indices,
++            colors,
++            material_params: None,
++            transform: None,
++            is_wireframe: false,
++            double_sided: true,
++        });
++        inner.to_shape(None).map_err(|e| e.to_string())?;
++        Ok(Self { inner })
++    }
++
++    pub fn clone_shape(&self) -> Self {
++        self.clone()
++    }
++}
+--- a/wasm/src/selection.rs
++++ b/wasm/src/selection.rs
+@@ -47,6 +47,7 @@
+     selection: js_sys::Function,
+     sphere: js_sys::Function,
+     stick: js_sys::Function,
++    mesh: js_sys::Function,
+     style: js_sys::Function,
+ }
+ thread_local! { static VIEWER_TYPES: RefCell<Option<ViewerTypes>> = const { RefCell::new(None) }; }
+@@ -55,6 +56,7 @@
+     selection: js_sys::Function,
+     sphere: js_sys::Function,
+     stick: js_sys::Function,
++    mesh: js_sys::Function,
+     style: js_sys::Function,
+ ) {
+     VIEWER_TYPES.with(|types| {
+@@ -62,6 +64,7 @@
+             selection,
+             sphere,
+             stick,
++            mesh,
+             style,
+         })
+     });
+@@ -125,7 +128,7 @@
+ #[wasm_bindgen]
+ extern "C" {
+     #[wasm_bindgen(
+-        typescript_type = "import(\"@cosmol-studio/cosmolkit\").Molecule | import(\"@cosmol-studio/cosmolkit\").Protein | Selection | Sphere | Stick"
++        typescript_type = "import(\"@cosmol-studio/cosmolkit\").Molecule | import(\"@cosmol-studio/cosmolkit\").Protein | Selection | Sphere | Stick | Mesh"
+     )]
+     pub type SceneInput;
+ }
+@@ -451,6 +454,11 @@
+                 .map_err(|_| error("expected live Stick"))?;
+             operation(&shape.inner)?;
+             Ok(None)
++        } else if viewer_instance(value, |types| &types.mesh)? {
++            let shape = crate::shapes::Mesh::try_from_js_value(call(value, "cloneShape")?)
++                .map_err(|_| error("expected live Mesh"))?;
++            operation(&shape.inner)?;
++            Ok(None)
+         } else if viewer_instance(value, |types| &types.selection)? {
+             // Official wasm-bindgen conversion consumes its argument. Convert an
+             // explicit clone so callers can reuse the original selection handle.

@@ -1,0 +1,28 @@
+# dependencies
+node_modules/
+webapp/node_modules/
+
+# build artifacts
+release/
+target/
+COSMol-viewer/target/
+*.AppImage
+*.exe
+*.zip
+
+# local toolchains / caches
+.cache/
+.cargo-home/
+.rustup/
+.rustup-local/
+.electron-cache/
+.electron-builder-cache/
+.electron-profile*/
+.wasm-pack-cache/
+.pylibs/
+.venv/
+tools/
+
+# local files
+*.log
+.DS_Store

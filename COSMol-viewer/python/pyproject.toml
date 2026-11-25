@@ -1,0 +1,31 @@
+[project]
+name = "cosmol-viewer"
+version = "0.6.3rc1"
+requires-python = ">=3.9"
+description = "Molecular visualization tools"
+license = { file = "../LICENSE" }
+dependencies = ["cosmolkit==0.6.2"]
+authors = [{name = "95028", email = "wjt@cosmol.org"}]
+readme = "README.md"
+
+[build-system]
+requires = ["maturin==1.15.0"]
+build-backend = "build_backend"
+backend-path = ["."]
+
+[tool.maturin]
+features = ["release-abi3-py39"]
+name = "cosmol_viewer"
+python-packages = ["cosmol_viewer_native"]
+exclude = ["**/__pycache__/**", "**/*.pyc"]
+include = [
+    { path = "cosmol_viewer_native/cosmol-viewer-native*", format = "wheel" },
+    { path = "build_backend.py", format = "sdist" },
+    { path = "build_native_viewer.py", format = "sdist" },
+    { path = "build.py", format = "sdist" },
+    { path = "framework/**", format = "sdist" },
+    { path = "cosmol_viewer.pyi", format = "sdist" },
+]
+
+[project.urls]
+Repository = "https://github.com/cosmol-studio/COSMol-viewer"

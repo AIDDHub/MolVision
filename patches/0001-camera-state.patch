@@ -1,0 +1,95 @@
+--- a/crates/core/src/shader/canvas.rs
++++ b/crates/core/src/shader/canvas.rs
+@@ -452,6 +452,22 @@
+         };
+         ui.painter().add(callback);
+         self.paint_overlay(ui, rect, animation_playing || self.auto_rotate.enabled);
++
++        // Publish the live camera for host overlays (labels, measurements).
++        // The value is read back through `latest_camera_snapshot`.
++        let (azimuth, elevation, roll) = self.camera_state.orbit_angles_degrees();
++        let frame = LAST_CAMERA.with(|cell| cell.get()).map_or(1, |camera| camera.frame + 1);
++        LAST_CAMERA.with(|cell| {
++            cell.set(Some(CameraSnapshot {
++                azimuth,
++                elevation,
++                roll,
++                distance: self.camera_state.distance,
++                target: self.camera_state.target.to_array(),
++                fov: self.camera_state.fov,
++                frame,
++            }));
++        });
+     }
+ 
+     fn paint_overlay(&mut self, ui: &egui::Ui, rect: egui::Rect, playing: bool) {
+@@ -1792,6 +1808,28 @@
+     }
+ }
+ 
++/// Snapshot of the live orbit camera, published for host-side overlays.
++#[derive(Clone, Copy, Debug, Default)]
++pub struct CameraSnapshot {
++    pub azimuth: f32,
++    pub elevation: f32,
++    pub roll: f32,
++    pub distance: f32,
++    pub target: [f32; 3],
++    pub fov: f32,
++    pub frame: u64,
++}
++
++std::thread_local! {
++    static LAST_CAMERA: std::cell::Cell<Option<CameraSnapshot>> =
++        const { std::cell::Cell::new(None) };
++}
++
++/// Latest camera state published by the most recent canvas paint.
++pub fn latest_camera_snapshot() -> Option<CameraSnapshot> {
++    LAST_CAMERA.with(|cell| cell.get())
++}
++
+ #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+ pub struct CameraState {
+     pub target: Vec3,
+--- a/crates/core/src/lib.rs
++++ b/crates/core/src/lib.rs
+@@ -35,6 +35,7 @@
+ use eframe::egui::{Color32, Stroke, UserData, ViewportCommand};
+ 
+ use shader::Canvas;
++pub use shader::{CameraSnapshot, latest_camera_snapshot};
+ 
+ use crate::scene::Animation;
+ pub use crate::utils::{Logger, RustLogger, Shape};
+--- a/wasm/src/viewer.rs
++++ b/wasm/src/viewer.rs
+@@ -121,6 +121,28 @@
+         })
+     }
+ 
++    /// Latest live camera published by the renderer:
++    /// `[azimuth, elevation, roll, distance, target.x, target.y, target.z, fov]`.
++    /// Empty until the first frame has been painted.
++    #[cfg(target_arch = "wasm32")]
++    pub fn camera_state(&self) -> Vec<f32> {
++        cosmol_viewer_core::latest_camera_snapshot()
++            .map(|camera| {
++                vec![
++                    camera.azimuth,
++                    camera.elevation,
++                    camera.roll,
++                    camera.distance,
++                    camera.target[0],
++                    camera.target[1],
++                    camera.target[2],
++                    camera.fov,
++                    camera.frame as f32,
++                ]
++            })
++            .unwrap_or_default()
++    }
++
+     /// Show renderer FPS. One diagnostic repaint shows zero after one second idle,
+     /// without counting that repaint or renewing the idle timer.
+     pub fn show_fps(&self, enabled: bool) -> Result<(), String> {

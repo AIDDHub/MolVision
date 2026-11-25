@@ -1,0 +1,514 @@
+--- a/crates/core/src/shader/canvas.rs
++++ b/crates/core/src/shader/canvas.rs
+@@ -443,7 +443,7 @@
+         let cb = egui_glow::CallbackFn::new(move |_info, painter| {
+             shader
+                 .lock()
+-                .paint(painter.gl(), aspect_ratio, &camera_state, true);
++                .paint(painter.gl(), aspect_ratio, &camera_state, true, true);
+         });
+ 
+         let callback = egui::PaintCallback {
+@@ -617,8 +617,20 @@
+     stick_instance_buffer: glow::Buffer,
+     instance_groups: Option<InstanceGroups>,
+     alpha_coverage: SceneAlphaCoverage,
++    mesh_double_sided: bool,
++    outline_enabled: bool,
++    ssao_enabled: bool,
++    outline_strength: f32,
++    ssao_strength: f32,
+     u_model: Mat4,
+     u_normal_matrix: Mat3,
++    post_program: Option<glow::Program>,
++    post_vao: Option<glow::VertexArray>,
++    post_vbo: Option<glow::Buffer>,
++    post_fbo: Option<glow::Framebuffer>,
++    post_color: Option<glow::Texture>,
++    post_depth: Option<glow::Texture>,
++    post_size: (i32, i32),
+ }
+ 
+ #[expect(unsafe_code)] // we need unsafe code to use glow
+@@ -878,8 +890,20 @@
+                 stick_outline_quad_vbo,
+                 instance_groups: None,
+                 alpha_coverage: SceneAlphaCoverage::default(),
++                mesh_double_sided: false,
++                outline_enabled: false,
++                ssao_enabled: false,
++                outline_strength: 0.2,
++                ssao_strength: 0.1,
+                 u_model: scene.model_matrix(),
+                 u_normal_matrix: scene.normal_matrix(),
++                post_program: None,
++                post_vao: None,
++                post_vbo: None,
++                post_fbo: None,
++                post_color: None,
++                post_depth: None,
++                post_size: (0, 0),
+             };
+ 
+             // =========================
+@@ -1228,15 +1252,21 @@
+         self.background_color = scene_background_color(scene);
+         self.zoom_disabled = scene.zoom_disabled;
+         self.depth_cue = scene.depth_cue;
++        self.outline_enabled = scene.outline_enabled;
++        self.ssao_enabled = scene.ssao_enabled;
++        self.outline_strength = scene.outline_strength;
++        self.ssao_strength = scene.ssao_strength;
+         self.depth_cue_color = scene.depth_cue.color.unwrap_or(scene.background_color);
+         self.vertex3d.clear();
+         self.indices.clear();
+         self.alpha_coverage = SceneAlphaCoverage::default();
++        self.mesh_double_sided = false;
+         self.scene_bounds = SceneBounds::empty();
+ 
+         let mut vertex_offset = 0u32;
+ 
+         for mesh in scene._get_meshes() {
++            self.mesh_double_sided |= mesh.double_sided;
+             self.vertex3d
+                 .extend(mesh.vertices.iter().enumerate().map(|(i, pos)| {
+                     Vertex3d {
+@@ -1446,12 +1476,19 @@
+                 pass,
+             );
+             gl.bind_vertex_array(self.vao_mesh);
++            if self.mesh_double_sided {
++                gl.disable(glow::CULL_FACE);
++            }
+             gl.draw_elements(
+                 glow::TRIANGLES,
+                 self.indices.len() as i32,
+                 glow::UNSIGNED_INT,
+                 0,
+             );
++            if self.mesh_double_sided {
++                gl.enable(glow::CULL_FACE);
++                gl.cull_face(glow::BACK);
++            }
+         }
+ 
+         if let Some(instance_groups) = self.instance_groups.as_ref() {
+@@ -1518,12 +1555,205 @@
+         }
+     }
+ 
++    unsafe fn release_post_target(&mut self, gl: &glow::Context) {
++        use glow::HasContext as _;
++        if let Some(fbo) = self.post_fbo.take() {
++            gl.delete_framebuffer(fbo);
++        }
++        if let Some(color) = self.post_color.take() {
++            gl.delete_texture(color);
++        }
++        if let Some(depth) = self.post_depth.take() {
++            gl.delete_texture(depth);
++        }
++        self.post_size = (0, 0);
++    }
++
++    unsafe fn ensure_post_target(&mut self, gl: &glow::Context, width: i32, height: i32) -> bool {
++        use glow::HasContext as _;
++        if width <= 0 || height <= 0 {
++            return false;
++        }
++        if self.post_fbo.is_some() && self.post_size == (width, height) {
++            return true;
++        }
++        self.release_post_target(gl);
++
++        let color = match gl.create_texture() {
++            Ok(texture) => texture,
++            Err(_) => return false,
++        };
++        gl.bind_texture(glow::TEXTURE_2D, Some(color));
++        gl.tex_image_2d(
++            glow::TEXTURE_2D,
++            0,
++            glow::RGBA8 as i32,
++            width,
++            height,
++            0,
++            glow::RGBA,
++            glow::UNSIGNED_BYTE,
++            glow::PixelUnpackData::Slice(None),
++        );
++        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
++        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
++        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
++        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
++
++        let depth = match gl.create_texture() {
++            Ok(texture) => texture,
++            Err(_) => {
++                gl.delete_texture(color);
++                return false;
++            }
++        };
++        gl.bind_texture(glow::TEXTURE_2D, Some(depth));
++        gl.tex_image_2d(
++            glow::TEXTURE_2D,
++            0,
++            glow::DEPTH_COMPONENT24 as i32,
++            width,
++            height,
++            0,
++            glow::DEPTH_COMPONENT,
++            glow::UNSIGNED_INT,
++            glow::PixelUnpackData::Slice(None),
++        );
++        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
++        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
++        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
++        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
++
++        let fbo = match gl.create_framebuffer() {
++            Ok(framebuffer) => framebuffer,
++            Err(_) => {
++                gl.delete_texture(depth);
++                gl.delete_texture(color);
++                return false;
++            }
++        };
++        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
++        gl.framebuffer_texture_2d(
++            glow::FRAMEBUFFER,
++            glow::COLOR_ATTACHMENT0,
++            glow::TEXTURE_2D,
++            Some(color),
++            0,
++        );
++        gl.framebuffer_texture_2d(
++            glow::FRAMEBUFFER,
++            glow::DEPTH_ATTACHMENT,
++            glow::TEXTURE_2D,
++            Some(depth),
++            0,
++        );
++        if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
++            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
++            gl.delete_framebuffer(fbo);
++            gl.delete_texture(depth);
++            gl.delete_texture(color);
++            return false;
++        }
++
++        if self.post_program.is_none() {
++            let shader_version = egui_glow::ShaderVersion::get(gl);
++            self.post_program = Some(Self::compile_program(
++                gl,
++                shader_version,
++                "postprocess",
++                include_str!("./post_vertex.glsl"),
++                include_str!("./post_fragment.glsl"),
++            ));
++            let vao = gl.create_vertex_array().unwrap();
++            let vbo = gl.create_buffer().unwrap();
++            gl.bind_vertex_array(Some(vao));
++            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
++            let quad: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
++            gl.buffer_data_u8_slice(
++                glow::ARRAY_BUFFER,
++                bytemuck::cast_slice(&quad),
++                glow::STATIC_DRAW,
++            );
++            gl.enable_vertex_attrib_array(0);
++            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
++            gl.bind_vertex_array(None);
++            self.post_vao = Some(vao);
++            self.post_vbo = Some(vbo);
++        }
++
++        self.post_fbo = Some(fbo);
++        self.post_color = Some(color);
++        self.post_depth = Some(depth);
++        self.post_size = (width, height);
++        true
++    }
++
++    unsafe fn draw_postprocess(&self, gl: &glow::Context, width: i32, height: i32, projection: Mat4) {
++        use glow::HasContext as _;
++        let Some(program) = self.post_program else { return; };
++        let Some(vao) = self.post_vao else { return; };
++        let Some(color) = self.post_color else { return; };
++        let Some(depth) = self.post_depth else { return; };
++
++        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
++        gl.disable(glow::DEPTH_TEST);
++        gl.disable(glow::CULL_FACE);
++        gl.disable(glow::BLEND);
++        gl.color_mask(true, true, true, true);
++        gl.use_program(Some(program));
++        gl.bind_vertex_array(Some(vao));
++
++        gl.active_texture(glow::TEXTURE0);
++        gl.bind_texture(glow::TEXTURE_2D, Some(color));
++        gl.uniform_1_i32(
++            gl.get_uniform_location(program, "u_color").as_ref(),
++            0,
++        );
++        gl.active_texture(glow::TEXTURE1);
++        gl.bind_texture(glow::TEXTURE_2D, Some(depth));
++        gl.uniform_1_i32(
++            gl.get_uniform_location(program, "u_depth").as_ref(),
++            1,
++        );
++        gl.uniform_2_f32(
++            gl.get_uniform_location(program, "u_texel").as_ref(),
++            1.0 / width as f32,
++            1.0 / height as f32,
++        );
++        gl.uniform_matrix_4_f32_slice(
++            gl.get_uniform_location(program, "u_inv_projection").as_ref(),
++            false,
++            projection.inverse().as_ref(),
++        );
++        gl.uniform_1_i32(
++            gl.get_uniform_location(program, "u_outline_enabled").as_ref(),
++            if self.outline_enabled { 1 } else { 0 },
++        );
++        gl.uniform_1_i32(
++            gl.get_uniform_location(program, "u_ssao_enabled").as_ref(),
++            if self.ssao_enabled { 1 } else { 0 },
++        );
++        gl.uniform_1_f32(
++            gl.get_uniform_location(program, "u_outline_strength").as_ref(),
++            self.outline_strength,
++        );
++        gl.uniform_1_f32(
++            gl.get_uniform_location(program, "u_ssao_strength").as_ref(),
++            self.ssao_strength,
++        );
++        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
++        gl.bind_vertex_array(None);
++        gl.use_program(None);
++        gl.active_texture(glow::TEXTURE0);
++    }
++
+     pub(super) fn paint(
+         &mut self,
+         gl: &glow::Context,
+         aspect_ratio: f32,
+         camera_state: &CameraState,
+         multisample: bool,
++        postprocess: bool,
+     ) {
+         let (u_view, u_projection, u_view_pos) = camera_state.matrices(aspect_ratio);
+ 
+@@ -1549,6 +1779,19 @@
+             .depth_range(self.u_model, u_view, self.depth_cue);
+ 
+         unsafe {
++            let mut viewport = [0_i32; 4];
++            gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
++            let post_width = viewport[2];
++            let post_height = viewport[3];
++            let use_post = postprocess
++                && (self.outline_enabled || self.ssao_enabled)
++                && self.ensure_post_target(gl, post_width, post_height);
++            if use_post {
++                if let Some(fbo) = self.post_fbo {
++                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
++                }
++            }
++
+             gl.color_mask(true, true, true, true);
+             gl.depth_mask(true);
+             gl.depth_func(glow::LESS);
+@@ -1605,11 +1848,20 @@
+             );
+ 
+             if self.alpha_coverage.has_transparent() {
+-                // ChimeraX-style single-layer transparency: first record only
+-                // the nearest transparent depth, then shade that exact layer.
+-                gl.color_mask(false, false, false, false);
+-                gl.disable(glow::BLEND);
+-                gl.depth_func(glow::LESS);
++                // Two-pass transparency: back faces first, then front faces.
++                // No transparent depth prepass, so both sides of a translucent
++                // surface remain visible instead of only the nearest layer.
++                gl.depth_mask(false);
++                gl.depth_func(glow::LEQUAL);
++                gl.enable(glow::BLEND);
++                gl.blend_func_separate(
++                    glow::SRC_ALPHA,
++                    glow::ONE_MINUS_SRC_ALPHA,
++                    glow::ONE,
++                    glow::ONE_MINUS_SRC_ALPHA,
++                );
++
++                gl.cull_face(glow::FRONT);
+                 self.draw_scene_pass(
+                     gl,
+                     u_view,
+@@ -1623,18 +1875,10 @@
+                     diffuse_light_intensity,
+                     specular_light_intensity,
+                     depth_cue_range,
+-                    SceneRenderPass::TransparentDepth,
++                    SceneRenderPass::TransparentColor,
+                 );
+ 
+-                gl.color_mask(true, true, true, true);
+-                gl.depth_func(glow::LEQUAL);
+-                gl.enable(glow::BLEND);
+-                gl.blend_func_separate(
+-                    glow::SRC_ALPHA,
+-                    glow::ONE_MINUS_SRC_ALPHA,
+-                    glow::ONE,
+-                    glow::ONE_MINUS_SRC_ALPHA,
+-                );
++                gl.cull_face(glow::BACK);
+                 self.draw_scene_pass(
+                     gl,
+                     u_view,
+@@ -1651,6 +1895,7 @@
+                     SceneRenderPass::TransparentColor,
+                 );
+ 
++                gl.depth_mask(true);
+                 gl.disable(glow::BLEND);
+                 gl.depth_func(glow::LESS);
+             }
+@@ -1784,6 +2029,9 @@
+             gl.disable(glow::BLEND);
+             gl.bind_vertex_array(None);
+             gl.use_program(None);
++            if use_post {
++                self.draw_postprocess(gl, post_width, post_height, u_projection);
++            }
+         }
+     }
+ 
+--- a/crates/core/src/shader/offscreen.rs
++++ b/crates/core/src/shader/offscreen.rs
+@@ -263,7 +263,7 @@
+             }
+ 
+             gl.viewport(0, 0, width as i32, height as i32);
+-            shader.paint(gl, aspect_ratio, &camera_state, true);
++            shader.paint(gl, aspect_ratio, &camera_state, true, false);
+             gl.finish();
+ 
+             let resolve_framebuffer = gl.create_framebuffer().map_err(|err| err.to_string())?;
+@@ -427,7 +427,7 @@
+ 
+     offscreen_trace("painting single-sample framebuffer");
+     gl.viewport(0, 0, width as i32, height as i32);
+-    shader.paint(gl, aspect_ratio, camera_state, false);
++    shader.paint(gl, aspect_ratio, camera_state, false, false);
+     offscreen_trace("finishing single-sample framebuffer");
+     gl.finish();
+ 
+--- a/crates/core/src/shader/fragment.glsl
++++ b/crates/core/src/shader/fragment.glsl
+@@ -38,8 +38,9 @@
+         return;
+     }
+ 
+-    // Normalize once
++    // Normalize once; double-sided meshes need the backface normal flipped.
+     vec3 N = normalize(v_normal);
++    if (!gl_FrontFacing) N = -N;
+     vec3 L = normalize(u_light_pos - v_frag_pos);
+     vec3 V = normalize(u_view_pos - v_frag_pos);
+     float roughness = clamp(v_material.x, 0.04, 1.0);
+--- a/crates/core/src/shader/post_vertex.glsl
++++ b/crates/core/src/shader/post_vertex.glsl
+@@ -0,0 +1,6 @@
++in vec2 a_pos;
++out vec2 v_uv;
++void main() {
++    v_uv = a_pos * 0.5 + 0.5;
++    gl_Position = vec4(a_pos, 0.0, 1.0);
++}
+--- a/crates/core/src/shader/post_fragment.glsl
++++ b/crates/core/src/shader/post_fragment.glsl
+@@ -0,0 +1,83 @@
++precision highp float;
++in vec2 v_uv;
++out vec4 out_color;
++uniform sampler2D u_color;
++uniform sampler2D u_depth;
++uniform vec2 u_texel;
++uniform mat4 u_inv_projection;
++uniform int u_outline_enabled;
++uniform int u_ssao_enabled;
++uniform float u_outline_strength;
++uniform float u_ssao_strength;
++
++vec3 viewPosition(vec2 uv) {
++    float z = texture(u_depth, uv).r * 2.0 - 1.0;
++    vec4 clip = vec4(uv * 2.0 - 1.0, z, 1.0);
++    vec4 view = u_inv_projection * clip;
++    return view.xyz / max(view.w, 0.00001);
++}
++
++vec3 normalAt(vec2 uv, float depthValue) {
++    if (depthValue > 0.9999) return vec3(0.0, 0.0, 1.0);
++    vec3 p = viewPosition(uv);
++    vec3 px = viewPosition(uv + vec2(u_texel.x, 0.0));
++    vec3 py = viewPosition(uv + vec2(0.0, u_texel.y));
++    return normalize(cross(px - p, py - p));
++}
++
++float depthAt(vec2 uv) {
++    return texture(u_depth, uv).r;
++}
++
++void main() {
++    vec4 color = texture(u_color, v_uv);
++    float depth = depthAt(v_uv);
++
++    float edge = 0.0;
++    edge = max(edge, abs(depth - depthAt(v_uv + vec2(u_texel.x, 0.0))));
++    edge = max(edge, abs(depth - depthAt(v_uv - vec2(u_texel.x, 0.0))));
++    edge = max(edge, abs(depth - depthAt(v_uv + vec2(0.0, u_texel.y))));
++    edge = max(edge, abs(depth - depthAt(v_uv - vec2(0.0, u_texel.y))));
++    vec3 normal = normalAt(v_uv, depth);
++    float normalEdge = 0.0;
++    normalEdge = max(normalEdge, 1.0 - dot(normal, normalAt(v_uv + vec2(u_texel.x, 0.0), depthAt(v_uv + vec2(u_texel.x, 0.0)))));
++    normalEdge = max(normalEdge, 1.0 - dot(normal, normalAt(v_uv - vec2(u_texel.x, 0.0), depthAt(v_uv - vec2(u_texel.x, 0.0)))));
++    normalEdge = max(normalEdge, 1.0 - dot(normal, normalAt(v_uv + vec2(0.0, u_texel.y), depthAt(v_uv + vec2(0.0, u_texel.y)))));
++    normalEdge = max(normalEdge, 1.0 - dot(normal, normalAt(v_uv - vec2(0.0, u_texel.y), depthAt(v_uv - vec2(0.0, u_texel.y)))));
++    if (u_outline_enabled != 0) {
++        float outline = smoothstep(0.00002, 0.0005, edge);
++        color.rgb = mix(color.rgb, vec3(0.03, 0.035, 0.045), outline * u_outline_strength);
++        color.a = max(color.a, outline * u_outline_strength * 1.4);
++    }
++
++    float occlusion = 0.0;
++    if (u_ssao_enabled == 0) {
++        out_color = color;
++        return;
++    }
++    vec3 position = viewPosition(v_uv);
++    vec2 r = u_texel * 4.0;
++    vec2 offsets[8] = vec2[8](
++        vec2(r.x, 0.0), vec2(r.x * 0.7, r.y * 0.7), vec2(0.0, r.y), vec2(-r.x * 0.7, r.y * 0.7),
++        vec2(-r.x, 0.0), vec2(-r.x * 0.7, -r.y * 0.7), vec2(0.0, -r.y), vec2(r.x * 0.7, -r.y * 0.7)
++    );
++    if (depth < 0.9999) {
++        for (int i = 0; i < 8; i++) {
++            vec2 uv2 = v_uv + offsets[i];
++            float d2 = depthAt(uv2);
++            if (d2 > 0.9999) continue;
++            vec3 samplePosition = viewPosition(uv2);
++            vec3 delta = samplePosition - position;
++            float distanceToSample = length(delta);
++            if (distanceToSample > 0.001 && distanceToSample < 0.85 && dot(normalize(delta), normal) > 0.2) {
++                if (samplePosition.z < position.z - 0.02) {
++                    occlusion += 1.0 - distanceToSample / 0.85;
++                }
++            }
++        }
++        occlusion /= 8.0;
++    }
++    color.rgb *= 1.0 - occlusion * u_ssao_strength;
++
++    out_color = color;
++}

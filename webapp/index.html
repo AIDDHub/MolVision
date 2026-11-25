@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MolVision · 简易分子结构浏览器</title>
+<link rel="stylesheet" href="./style.css">
+<script type="importmap">
+{
+  "imports": {
+    "@cosmol-studio/cosmolkit": "./node_modules/@cosmol-studio/cosmolkit/cosmolkit_wasm.js",
+    "@cosmol-studio/cosmol-viewer": "./node_modules/@cosmol-studio/cosmol-viewer/index.js"
+  }
+}
+</script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">M</span>
+    <div>
+      <h1>MolVision</h1>
+      <p data-i18n="简易分子结构浏览器">简易分子结构浏览器</p>
+    </div>
+  </div>
+  <div class="actions">
+    <button class="btn" id="lang" title="切换语言 / Switch language">EN</button>
+    <label class="btn primary" id="openLabel">
+      <span data-i18n="打开文件">打开文件</span>
+      <input id="file" type="file" multiple accept=".sdf,.mol,.mol2,.xyz,.pdb,.ent,.cif,.mmcif,.csv,.tsv,.txt,.xlsx,.gz">
+    </label>
+    <label class="btn select-wrap" title="显示样式">
+      <span data-i18n="样式">样式</span>
+      <select id="style"></select>
+    </label>
+    <label class="btn select-wrap" title="背景">
+      <span data-i18n="背景">背景</span>
+      <select id="background">
+        <option value="dark" data-i18n="深色">深色</option>
+        <option value="white" data-i18n="白色">白色</option>
+        <option value="transparent" data-i18n="透明">透明</option>
+      </select>
+    </label>
+    <label class="btn check-wrap" title="导出时保持当前视角">
+      <input type="checkbox" id="keepView"> <span data-i18n="保持视角">保持视角</span>
+    </label>
+    <label class="btn select-wrap" title="核酸透明度">
+      <span data-i18n="核酸">核酸</span>
+      <select id="nucleicOpacity">
+        <option value="1" selected>1.0</option>
+        <option value="0.8">0.8</option>
+        <option value="0.6">0.6</option>
+      </select>
+    </label>
+    <label class="btn select-wrap" title="表面透明度">
+      <span data-i18n="表面">表面</span>
+      <select id="surfaceOpacity">
+        <option value="0.2">0.2</option>
+        <option value="0.35" selected>0.35</option>
+        <option value="0.5">0.5</option>
+        <option value="0.7">0.7</option>
+      </select>
+    </label>
+    <label class="btn select-wrap" title="导出分辨率">
+      <span data-i18n="导出">导出</span>
+      <select id="resolution">
+        <option value="1920x1080">1920×1080</option>
+        <option value="2560x1440">2560×1440</option>
+        <option value="3840x2160">3840×2160</option>
+        <option value="2048x2048">2048×2048</option>
+        <option value="auto" data-i18n="窗口尺寸">窗口尺寸</option>
+      </select>
+    </label>
+    <label class="btn check-wrap" title="后处理描边"><input type="checkbox" id="outlineToggle"> <span data-i18n="描边">描边</span></label>
+    <label class="btn check-wrap" title="环境光遮蔽"><input type="checkbox" id="ssaoToggle"> <span data-i18n="SSAO">SSAO</span></label>
+    <label class="btn check-wrap" title="大结构自动切 CA 骨架"><input type="checkbox" id="autoLod" checked> <span data-i18n="自动 LOD">自动 LOD</span></label>
+    <label class="btn select-wrap" title="效果强度">
+      <span data-i18n="效果">效果</span>
+      <select id="effectStrength">
+        <option value="0.5">弱</option>
+        <option value="1" selected>标准</option>
+        <option value="1.8">强</option>
+      </select>
+    </label>
+    <button class="btn" id="reset" data-i18n="重置视角">重置视角</button>
+    <button class="btn" id="shot" data-i18n="保存图片">保存图片</button>
+    <button class="btn" id="copyImage" data-i18n="复制图片">复制图片</button>
+    <button class="btn" id="exportPdf" data-i18n="导出 PDF">导出 PDF</button>
+    <button class="btn" id="exportWebm" data-i18n="导出动画">导出动画</button>
+    <button class="btn" id="exportGif" data-i18n="导出 GIF">导出 GIF</button>
+    <button class="btn" id="help" title="帮助 / Help">?</button>
+    <button class="btn" id="theme" title="主题 / Theme">☀</button>
+    <button class="btn" id="fullscreen" title="全屏 / Fullscreen">⛶</button>
+    <input id="cidInput" class="cid-input" placeholder="选择 CID，例如 A/3-4" title="按 CID 新建选择">
+    <button class="btn" id="cidApply" data-i18n="选择">选择</button>
+    <button class="btn" id="batch" data-i18n="批量导出">批量导出</button>
+    <button class="btn" id="overlay" disabled>叠加选中 (0)</button>
+    <button class="btn" id="animate" disabled>序列动画</button>
+    <button class="btn" id="saveProject" data-i18n="保存项目">保存项目</button>
+    <label class="btn" id="openProjectLabel"><span data-i18n="打开项目">打开项目</span><input id="projectFile" type="file" accept=".mvproj,.json" hidden></label>
+    <button class="btn" id="restoreSession" hidden data-i18n="恢复上次会话">恢复上次会话</button>
+    <select id="recent" class="recent-select" hidden title="最近项目"></select>
+    <div class="mode-group" role="group" aria-label="标注模式">
+      <button class="btn mode active" data-mode="browse" data-i18n="浏览">浏览</button>
+      <button class="btn mode" data-mode="label" data-i18n="标签">标签</button>
+      <button class="btn mode" data-mode="measure" data-i18n="测距">测距</button>
+      <button class="btn mode" data-mode="angle" data-i18n="角度">角度</button>
+      <button class="btn mode" data-mode="dihedral" data-i18n="二面角">二面角</button>
+      <button class="btn" id="undo" disabled data-i18n="撤销">撤销</button>
+      <button class="btn" id="redo" disabled data-i18n="重做">重做</button>
+      <button class="btn" id="clearAnnotations" data-i18n="清除标注">清除标注</button>
+    </div>
+    <div class="mode-group" role="group" aria-label="视图模式">
+      <button class="btn view-mode active" data-view="3d">3D</button>
+      <button class="btn view-mode" data-view="2d">2D</button>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <div class="section-head">
+      <span data-i18n="结构列表">结构列表</span>
+      <span class="pill" id="count">0</span>
+    </div>
+    <input id="search" class="search" type="search" placeholder="搜索名称 / 格式 / 类型…" data-i18n-placeholder="搜索名称 / 格式 / 类型…">
+    <ul id="list" class="list"></ul>
+    <div id="empty" class="empty">
+      <div class="empty-icon">⌬</div>
+      <p><span data-i18n="拖入">拖入</span> <b>SDF / PDB / mmCIF / CSV</b> <span data-i18n="文件">文件</span></p>
+      <p class="muted" data-i18n="或点击右上角“打开文件”。">或点击右上角“打开文件”。</p>
+    </div>
+    <section id="info" class="info" hidden>
+      <h2 id="infoName">—</h2>
+      <dl id="infoBody"></dl>
+    </section>
+    <section id="annotationPanel" class="annotations-panel" hidden>
+      <div class="section-head">
+        <span data-i18n="标注">标注</span>
+        <span class="pill" id="annotationCount">0</span>
+        <button class="btn tiny" id="addLabelBtn" data-i18n="从列表添加">从列表添加</button>
+        <button class="btn tiny" id="exportAnnotations" data-i18n="导出 CSV">导出 CSV</button>
+        <button class="btn tiny" id="toggleAnnotations" title="折叠/展开">−</button>
+      </div>
+      <div id="labelPicker" class="label-picker" hidden>
+        <input id="labelSearch" type="search" placeholder="搜索原子/残基…" data-i18n-placeholder="搜索原子/残基…">
+        <div id="labelCandidates" class="candidate-list"></div>
+      </div>
+      <div id="labelList" class="annotation-list"></div>
+      <div id="measurementList" class="annotation-list"></div>
+    </section>
+  </aside>
+
+  <div class="splitter" id="splitter" title="拖动调整侧栏宽度"></div>
+  <main class="stage" id="stage">
+    <canvas id="canvas" width="1280" height="800"></canvas>
+    <canvas id="annotations" class="annotations"></canvas>
+    <div id="view2d" class="view2d" hidden>
+      <div id="rdkitSvg" class="rdkit-svg"></div>
+      <div class="view2d-bar">
+        <label class="check-wrap" style="color:#31506f"><input type="checkbox" id="atomIndices"> <span data-i18n="显示原子编号">显示原子编号</span></label>
+        <button class="btn" id="export2d" data-i18n="导出 2D SVG">导出 2D SVG</button>
+      </div>
+    </div>
+    <div class="hint" id="hint" data-i18n="拖拽旋转 · 滚轮缩放 · 右键平移">拖拽旋转 · 滚轮缩放 · 右键平移</div>
+    <div class="drop" id="drop"><span data-i18n="松开以导入文件">松开以导入文件</span></div>
+    <div class="busy" id="busy" hidden>
+      <div class="spinner"></div>
+      <span id="busyText" data-i18n="解析中…">解析中…</span>
+      <button class="btn" id="busyCancel" hidden data-i18n="取消">取消</button>
+    </div>
+    <div class="badge" id="kindBadge" hidden></div>
+  </main>
+</div>
+
+
+<div id="helpModal" class="modal" hidden>
+  <div class="modal-card help-card">
+    <div class="modal-head">
+      <h2 data-i18n="快捷键与提示">快捷键与提示</h2>
+      <button class="btn tiny" id="helpClose" data-i18n="关闭">关闭</button>
+    </div>
+    <div class="help-grid">
+      <span>Ctrl/Cmd+O</span><span data-i18n="打开文件">打开文件</span>
+      <span>Ctrl/Cmd+S</span><span data-i18n="保存项目">保存项目</span>
+      <span>Ctrl/Cmd+Z</span><span data-i18n="撤销">撤销</span>
+      <span>Ctrl/Cmd+Shift+Z</span><span data-i18n="重做">重做</span>
+      <span>Ctrl/Cmd+Shift+C</span><span data-i18n="复制图片">复制图片</span>
+      <span>Ctrl/Cmd+E</span><span data-i18n="保存图片">保存图片</span>
+      <span>1 / 2</span><span>3D / 2D</span>
+      <span>F11</span><span data-i18n="全屏">全屏</span>
+      <span>Esc</span><span data-i18n="关闭弹窗">关闭弹窗</span>
+    </div>
+    <p class="muted" data-i18n="蛋白可按 CID 选择，例如 A/3-4 或 A/(ALA)。">蛋白可按 CID 选择，例如 A/3-4 或 A/(ALA)。</p>
+  </div>
+</div>
+
+<div id="csvModal" class="modal" hidden>
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2 data-i18n="CSV 导入设置">CSV 导入设置</h2>
+      <span id="csvFile" class="muted"></span>
+    </div>
+    <div class="modal-row">
+      <label><span data-i18n="分隔符">分隔符</span>
+        <select id="csvDelimiter">
+          <option value="auto" data-i18n="自动">自动</option>
+          <option value="," data-i18n="逗号">逗号</option>
+          <option value=";" data-i18n="分号">分号</option>
+          <option value="\t" data-i18n="制表符">制表符</option>
+        </select>
+      </label>
+      <label class="check"><input type="checkbox" id="csvHeader" checked> <span data-i18n="首行为表头">首行为表头</span></label>
+    </div>
+    <div id="csvPreview" class="csv-preview"></div>
+    <div class="modal-row">
+      <label class="check"><input type="radio" name="csvMode" value="smiles" checked> <span data-i18n="每行一个分子（SMILES）">每行一个分子（SMILES）</span></label>
+      <label class="check"><input type="radio" name="csvMode" value="coords"> <span data-i18n="整表一个结构（坐标）">整表一个结构（坐标）</span></label>
+    </div>
+    <div id="csvSmilesFields" class="modal-grid">
+      <label><span data-i18n="SMILES 列">SMILES 列</span> <select id="csvSmilesCol"></select></label>
+      <label><span data-i18n="名称列">名称列</span> <select id="csvNameCol"></select></label>
+    </div>
+    <div id="csvCoordFields" class="modal-grid" hidden>
+      <label><span data-i18n="元素列">元素列</span> <select id="csvElementCol"></select></label>
+      <label><span data-i18n="X 列">X 列</span> <select id="csvXCol"></select></label>
+      <label><span data-i18n="Y 列">Y 列</span> <select id="csvYCol"></select></label>
+      <label><span data-i18n="Z 列">Z 列</span> <select id="csvZCol"></select></label>
+    </div>
+    <label class="check" style="display:flex;gap:6px;margin:8px 0;color:var(--muted);font-size:12px">
+      <input type="checkbox" id="csvApplyAll"> <span data-i18n="应用到本次全部 CSV">应用到本次全部 CSV</span>
+    </label>
+    <div id="csvValid" class="csv-valid"></div>
+    <div class="modal-actions">
+      <button id="csvCancel" class="btn" data-i18n="取消">取消</button>
+      <button id="csvImport" class="btn primary" data-i18n="导入">导入</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" hidden></div>
+
+<script src="./node_modules/jszip/dist/jszip.min.js"></script>
+<script src="./node_modules/@rdkit/rdkit/dist/RDKit_minimal.js"></script>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

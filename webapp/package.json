@@ -1,0 +1,11 @@
+{
+  "name": "molvision-poc",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@cosmol-studio/cosmol-viewer": "0.6.2",
+    "@cosmol-studio/cosmolkit": "0.6.2",
+    "@rdkit/rdkit": "^2026.9.2",
+    "jszip": "^3.10.2"
+  }
+}

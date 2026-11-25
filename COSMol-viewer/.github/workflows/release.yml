@@ -1,0 +1,173 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: github-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Find an unreleased tag on this commit
+        id: release_tag
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tags = await github.paginate(github.rest.repos.listTags, {
+              ...context.repo, per_page: 100,
+            });
+            const candidates = tags.filter(tag =>
+              tag.name.startsWith('v') && tag.commit.sha === context.sha &&
+              (!context.ref.startsWith('refs/tags/') ||
+                context.ref === `refs/tags/${tag.name}`)
+            );
+            if (candidates.length === 0) {
+              core.notice('This commit has no matching v* tag; no Release created.');
+              return;
+            }
+            // Include drafts and prereleases: never update an existing Release.
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              ...context.repo, per_page: 100,
+            });
+            const released = new Set(releases.map(release => release.tag_name));
+            const pending = candidates.filter(tag => !released.has(tag.name));
+            if (pending.length === 0) {
+              core.notice('This commit has no unreleased tag; no Release created.');
+              return;
+            }
+            if (pending.length !== 1) {
+              core.setFailed('Multiple unreleased tags point to this commit. Run this workflow on the intended tag ref.');
+              return;
+            }
+            core.setOutput('tag', pending[0].name);
+            core.info(`Release tag: ${pending[0].name}`);
+
+      - name: Checkout
+        if: steps.release_tag.outputs.tag != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Read release notes from changelog
+        if: steps.release_tag.outputs.tag != ''
+        env:
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_version="${RELEASE_TAG#v}"
+          release_header="$RUNNER_TEMP/release-header.md"
+          release_footer="$RUNNER_TEMP/release-footer.md"
+          version_notes="$RUNNER_TEMP/version-notes.md"
+          release_notes="$RUNNER_TEMP/release-notes.md"
+          if ! awk '
+              $0 == "<!-- release-header:start -->" {
+                found_start = 1
+                copying = 1
+                next
+              }
+              $0 == "<!-- release-header:end -->" {
+                if (copying) {
+                  found_end = 1
+                  exit
+                }
+              }
+              copying {
+                print
+              }
+              END {
+                if (!found_start || !found_end) {
+                  exit 2
+                }
+              }
+            ' CHANGELOG.md > "$release_header"; then
+            echo "CHANGELOG.md has no complete release-header block" >&2
+            exit 1
+          fi
+          if ! grep -q '[^[:space:]]' "$release_header"; then
+            echo "CHANGELOG.md has an empty release-header block" >&2
+            exit 1
+          fi
+          if ! awk '
+              $0 == "<!-- release-footer:start -->" {
+                found_start = 1
+                copying = 1
+                next
+              }
+              $0 == "<!-- release-footer:end -->" {
+                if (copying) {
+                  found_end = 1
+                  exit
+                }
+              }
+              copying {
+                print
+              }
+              END {
+                if (!found_start || !found_end) {
+                  exit 2
+                }
+              }
+            ' CHANGELOG.md > "$release_footer"; then
+            echo "CHANGELOG.md has no complete release-footer block" >&2
+            exit 1
+          fi
+          if ! awk -v version="$release_version" '
+              index($0, "## [" version "]") == 1 {
+                found = 1
+                release_heading = $0
+                sub(/^## \[/, "## COSMol Viewer v", release_heading)
+                sub(/\] - /, " — ", release_heading)
+                print release_heading
+                next
+              }
+              found && /^## \[/ {
+                exit
+              }
+              found {
+                print
+              }
+              END {
+                if (!found) {
+                  exit 2
+                }
+              }
+            ' CHANGELOG.md > "$version_notes"; then
+            echo "CHANGELOG.md has no section for $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if ! grep -q '[^[:space:]]' "$version_notes"; then
+            echo "CHANGELOG.md has no release notes for $RELEASE_TAG" >&2
+            exit 1
+          fi
+          {
+            cat "$release_header"
+            printf '\n'
+            cat "$version_notes"
+            printf '\n'
+            cat "$release_footer"
+          } > "$release_notes"
+
+      - name: Create GitHub Release
+        if: steps.release_tag.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags=()
+          case "$RELEASE_TAG" in
+            *-dev.*|*-rc.*) flags+=(--prerelease --latest=false) ;;
+          esac
+          gh release create "$RELEASE_TAG" --verify-tag \
+            --title "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md" "${flags[@]}"
